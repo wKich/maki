@@ -3531,3 +3531,543 @@ fn tool_output_wraps_behind_the_gutter_and_copies_without_it() {
         "copy kept the gutter: {copied:?}"
     );
 }
+
+fn compact_panel() -> MessagesPanel {
+    let config = UiConfig {
+        compact_transcript: true,
+        ..UiConfig::default()
+    };
+    MessagesPanel::new(config, EventHandle::disconnected_for_test())
+}
+
+fn summary_seg(panel: &MessagesPanel, key: usize) -> usize {
+    panel
+        .folds
+        .iter()
+        .find(|fold| fold.first_msg == key)
+        .expect("fold missing")
+        .summary_seg
+}
+
+fn segment_text(panel: &MessagesPanel, seg: usize) -> String {
+    panel
+        .cache
+        .get(seg)
+        .expect("segment missing")
+        .lines()
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+fn click_row(panel: &mut MessagesPanel, row: u16) -> ClickOutcome {
+    panel.handle_click(row, 0, Rect::new(0, 0, VIEW_WIDTH, VIEW_HEIGHT))
+}
+
+fn click_segment(panel: &mut MessagesPanel, seg: usize) -> ClickOutcome {
+    render(panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let row = seg_start_row(panel, seg);
+    let scroll = seg_start_row(panel, panel.scroll.seg) + u32::from(panel.scroll.row);
+    click_row(
+        panel,
+        u16::try_from(row - scroll).expect("segment must be on screen"),
+    )
+}
+
+const LIVE_REASONING: &str = "live reasoning that must stay folded";
+
+#[test]
+fn compact_run_renders_one_summary_segment() {
+    let mut panel = compact_panel();
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_start(start("t2", "read"));
+    let terminal = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    assert_eq!(panel.folds.len(), 1);
+    assert_eq!((panel.folds[0].first_msg, panel.folds[0].end_msg), (0, 2));
+    assert!(panel.cache.find_by_tool_id("t1").is_none());
+    assert_eq!(
+        panel.cache.get(summary_seg(&panel, 0)).unwrap().fold,
+        Some(0)
+    );
+    assert!(
+        buffer_text(&terminal).contains(&format!("{BASH_TOOL_NAME}> t1")),
+        "a busy run shows its first header"
+    );
+
+    panel.tool_done(done("t1"));
+    panel.tool_done(ToolDoneEvent {
+        tool: "read".into(),
+        ..done("t2")
+    });
+    let terminal = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let summary = segment_text(&panel, summary_seg(&panel, 0));
+    assert_eq!(summary, "1 command, 1 read");
+    assert_eq!(
+        panel
+            .cache
+            .get(summary_seg(&panel, 0))
+            .unwrap()
+            .gutter
+            .as_ref()
+            .unwrap()
+            .content,
+        TOOL_INDICATOR
+    );
+    assert!(buffer_text(&terminal).contains(&format!("{TOOL_INDICATOR}1 command, 1 read")));
+}
+
+#[test]
+fn compact_streaming_thinking_joins_the_open_run_summary() {
+    let mut panel = compact_panel();
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_done(done("t1"));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    panel.thinking_delta(LIVE_REASONING);
+    let terminal = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let text = buffer_text(&terminal);
+
+    assert_eq!(
+        segment_text(&panel, summary_seg(&panel, 0)),
+        "1 command, 1 thought"
+    );
+    assert!(!text.contains(LIVE_REASONING), "{text}");
+    assert!(!text.contains(thinking_style().label), "{text}");
+}
+
+#[test]
+fn compact_streaming_thinking_opens_the_summary_row() {
+    let mut panel = compact_panel();
+    panel.push(DisplayMessage::new(DisplayRole::User, "hi".into()));
+    panel.thinking_delta(LIVE_REASONING);
+    let terminal = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let summary = panel.cache.len() - 1;
+
+    assert_eq!(panel.cache.get(summary).unwrap().fold, None);
+    assert_eq!(segment_text(&panel, summary), "1 thought");
+    assert!(!buffer_text(&terminal).contains(LIVE_REASONING));
+
+    panel.text_delta("");
+    panel.streaming_text.set_buffer("answer");
+    let terminal = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    assert_eq!(summary_seg(&panel, 1), summary);
+    assert_eq!(segment_text(&panel, summary), "1 thought");
+    assert!(buffer_text(&terminal).contains("answer"));
+    assert!(!buffer_text(&terminal).contains(LIVE_REASONING));
+}
+
+#[test]
+fn compact_streaming_thinking_keeps_raw_rows_in_an_expanded_run() {
+    let mut panel = compact_panel();
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_done(done("t1"));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    panel.toggle_fold(0);
+
+    panel.thinking_delta(LIVE_REASONING);
+    panel.streaming_thinking.set_buffer(LIVE_REASONING);
+    let terminal = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    assert!(buffer_text(&terminal).contains(LIVE_REASONING));
+    assert_eq!(
+        segment_text(&panel, summary_seg(&panel, 0)),
+        "1 command, 1 thought"
+    );
+}
+
+#[test]
+fn compact_streaming_thinking_asks_for_the_spinner_cadence() {
+    let mut panel = compact_panel();
+    panel.push(DisplayMessage::new(DisplayRole::User, "hi".into()));
+    panel.thinking_delta(THINKING_TEXT);
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    assert_eq!(panel.cadence(), Cadence::SPINNER);
+}
+
+#[test]
+fn compact_stream_reset_drops_the_live_thought_from_the_summary() {
+    let mut panel = compact_panel();
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_done(done("t1"));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    panel.thinking_delta(LIVE_REASONING);
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    assert_eq!(
+        segment_text(&panel, summary_seg(&panel, 0)),
+        "1 command, 1 thought"
+    );
+
+    panel.stream_reset();
+    let terminal = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    assert_eq!(segment_text(&panel, summary_seg(&panel, 0)), "1 command");
+    assert!(!buffer_text(&terminal).contains("1 thought"));
+}
+
+#[test]
+fn full_mode_keeps_each_row_and_no_folds() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    assert!(panel.folds.is_empty());
+    assert!(panel.cache.find_by_tool_id("t1").is_some());
+    assert!(panel.cache.get(0).unwrap().fold.is_none());
+}
+
+const TOOL_BG_THEME: &str = r##"
+[palette]
+background = "#000000"
+surface = "#1d2021"
+[ui]
+tool_bg = { bg = "surface" }
+"##;
+
+#[test]
+fn compact_summaries_use_tool_bg() {
+    crate::theme::set(Theme::from_toml(TOOL_BG_THEME).unwrap());
+    let tool_bg = Color::Rgb(0x1d, 0x20, 0x21);
+
+    let mut panel = compact_panel();
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_done(done("t1"));
+    let terminal = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let row = row_of(&terminal, "1 command");
+    let buf = terminal.backend().buffer();
+    assert_eq!(buf.cell((0, row)).unwrap().bg, tool_bg);
+    assert_eq!(buf.cell((VIEW_WIDTH - 2, row)).unwrap().bg, tool_bg);
+
+    let mut live = compact_panel();
+    live.thinking_delta("still reasoning");
+    let terminal = render(&mut live, VIEW_WIDTH, VIEW_HEIGHT);
+    let row = row_of(&terminal, "1 thought");
+    let buf = terminal.backend().buffer();
+    assert_eq!(buf.cell((0, row)).unwrap().bg, tool_bg);
+    assert_eq!(buf.cell((VIEW_WIDTH - 2, row)).unwrap().bg, tool_bg);
+}
+
+#[test]
+fn clicking_the_summary_expands_then_collapses_its_rows() {
+    let mut panel = compact_panel();
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let summary = summary_seg(&panel, 0);
+
+    assert_eq!(click_row(&mut panel, 0), ClickOutcome::Handled);
+    assert!(panel.expanded_folds.contains(&0));
+    assert_eq!(summary_seg(&panel, 0), summary);
+    assert_eq!(panel.cache.get(summary).unwrap().fold, Some(0));
+    assert!(panel.cache.find_by_tool_id("t1").is_some());
+
+    assert_eq!(click_row(&mut panel, 0), ClickOutcome::Handled);
+    assert!(!panel.expanded_folds.contains(&0));
+    assert!(panel.cache.find_by_tool_id("t1").is_none());
+    assert_eq!(summary_seg(&panel, 0), summary);
+}
+
+#[test]
+fn expanded_fold_renders_the_same_rows_as_full_mode() {
+    let mut compact = compact_panel();
+    let mut full = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    for panel in [&mut compact, &mut full] {
+        panel.push(DisplayMessage::new(
+            DisplayRole::Thinking,
+            "thinking".into(),
+        ));
+        panel.tool_start(start("t1", BASH_TOOL_NAME));
+        panel.tool_done(done("t1"));
+    }
+
+    let full_rows = screen_rows(&mut full);
+    render(&mut compact, VIEW_WIDTH, VIEW_HEIGHT);
+    compact.toggle_fold(0);
+    let compact_rows: Vec<String> = screen_rows(&mut compact)
+        .into_iter()
+        .filter(|row| !row.starts_with('−'))
+        .collect();
+
+    assert_eq!(compact_rows, full_rows);
+}
+
+#[test]
+fn a_moved_task_splits_the_run_and_stays_visible() {
+    let mut panel = compact_panel();
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_start(start("t2", BASH_TOOL_NAME));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    assert_eq!(panel.folds.len(), 1);
+
+    panel.set_tool_background(
+        "t1",
+        BackgroundBadge {
+            id: "task".into(),
+            started_at: None,
+            outcome: None,
+        },
+    );
+    let terminal = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    assert_eq!(panel.folds.len(), 1);
+    assert_eq!((panel.folds[0].first_msg, panel.folds[0].end_msg), (1, 2));
+    assert!(panel.cache.find_by_tool_id("t1").is_some());
+    assert!(buffer_text(&terminal).contains(BACKGROUND_INDICATOR.trim()));
+}
+
+#[test]
+fn a_collapsed_fold_extension_keeps_its_new_rows_hidden() {
+    let mut panel = compact_panel();
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_done(done("t1"));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    panel.tool_start(start("t2", "read"));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    assert_eq!((panel.folds[0].first_msg, panel.folds[0].end_msg), (0, 2));
+    assert!(panel.cache.find_by_tool_id("t2").is_none());
+    assert_eq!(segment_text(&panel, summary_seg(&panel, 0)), "1 command");
+}
+
+#[test]
+fn new_activity_updates_a_collapsed_summary_and_shows_rows_when_expanded() {
+    let mut panel = compact_panel();
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    panel.toggle_fold(0);
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    assert_eq!(panel.folds[0].end_msg, 1);
+
+    panel.tool_start(start("t2", "read"));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    assert_eq!((panel.folds[0].first_msg, panel.folds[0].end_msg), (0, 2));
+    assert!(panel.cache.find_by_tool_id("t2").is_some());
+
+    panel.toggle_fold(0);
+    panel.tool_done(done("t1"));
+    panel.tool_done(ToolDoneEvent {
+        tool: "read".into(),
+        ..done("t2")
+    });
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    assert!(panel.cache.find_by_tool_id("t2").is_none());
+    assert_eq!(
+        segment_text(&panel, summary_seg(&panel, 0)),
+        "1 command, 1 read"
+    );
+    assert_eq!(
+        panel
+            .cache
+            .get(summary_seg(&panel, 0))
+            .unwrap()
+            .gutter
+            .as_ref()
+            .unwrap()
+            .content,
+        TOOL_INDICATOR
+    );
+}
+
+#[test]
+fn reload_clears_expansion_and_rebuilds_folds() {
+    let mut panel = compact_panel();
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    panel.toggle_fold(0);
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    assert!(panel.expanded_folds.contains(&0));
+
+    panel.load_messages(panel.messages.clone());
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    assert!(panel.expanded_folds.is_empty());
+    assert_eq!(panel.folds.len(), 1);
+    assert!(panel.cache.find_by_tool_id("t1").is_none());
+}
+
+#[test]
+fn summary_shows_a_folded_tool_turn_usage() {
+    const USAGE: &str = "10.6k↑ 148↓ $0.009";
+    let mut panel = compact_panel();
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_done(done("t1"));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    panel.set_tool_turn_usage("t1", USAGE.into());
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    let text = segment_text(&panel, summary_seg(&panel, 0));
+    assert!(text.starts_with("1 command"), "{text:?}");
+    assert!(text.ends_with(USAGE), "{text:?}");
+}
+
+#[test]
+fn tool_output_leaves_a_collapsed_summary_alone() {
+    let mut panel = compact_panel();
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let summary = summary_seg(&panel, 0);
+    let before = segment_text(&panel, summary);
+
+    panel.tool_output("t1", "more output");
+
+    assert_eq!(segment_text(&panel, summary), before);
+}
+
+#[test]
+fn search_reaches_hidden_tool_output_and_selecting_expands_fold() {
+    const NEEDLE: &str = "hidden-needle";
+    let mut panel = compact_panel();
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_done(ToolDoneEvent {
+        output: Arc::new(ToolOutput::Plain(NEEDLE.into())),
+        ..done("t1")
+    });
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    let texts = panel.segment_search_texts();
+    let hit = texts
+        .iter()
+        .position(|text| text.contains(NEEDLE))
+        .expect("folded output must be searchable");
+    assert_eq!(hit, summary_seg(&panel, 0));
+
+    panel.scroll_to_segment(hit);
+
+    assert!(panel.expanded_folds.contains(&0));
+    let tool_seg = panel.cache.find_by_tool_id("t1").unwrap();
+    assert!(panel.segment_search_texts()[tool_seg].contains(NEEDLE));
+}
+
+#[test]
+fn full_mode_search_still_finds_tool_output() {
+    const NEEDLE: &str = "visible-needle";
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_done(ToolDoneEvent {
+        output: Arc::new(ToolOutput::Plain(NEEDLE.into())),
+        ..done("t1")
+    });
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    let texts = panel.segment_search_texts();
+    let tool_seg = panel.cache.find_by_tool_id("t1").unwrap();
+    assert!(texts[tool_seg].contains(NEEDLE));
+    assert!(panel.folds.is_empty());
+}
+
+#[test]
+fn search_reaches_hidden_instruction_text() {
+    const NEEDLE: &str = "follow style guide";
+    let mut panel = compact_panel();
+    panel.tool_start(start("t1", "read"));
+    panel.tool_done(ToolDoneEvent {
+        tool: "read".into(),
+        output: Arc::new(read_code_with_instructions(instruction_blocks())),
+        ..done("t1")
+    });
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    let texts = panel.segment_search_texts();
+    assert!(texts[summary_seg(&panel, 0)].contains(NEEDLE));
+}
+
+#[test]
+fn expanding_inside_a_scrolled_transcript_keeps_the_summary_visible() {
+    let mut panel = compact_panel();
+    for i in 0..8 {
+        panel.push(DisplayMessage::new(
+            DisplayRole::Assistant,
+            format!("filler {i}"),
+        ));
+    }
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    render(&mut panel, VIEW_WIDTH, 10);
+    assert!(panel.auto_scroll());
+
+    let summary = summary_seg(&panel, panel.folds[0].first_msg);
+    let summary_row = seg_start_row(&panel, summary);
+    let scroll_row = seg_start_row(&panel, panel.scroll.seg) + u32::from(panel.scroll.row);
+    let screen_row = u16::try_from(summary_row - scroll_row).expect("summary must be on screen");
+    click_row(&mut panel, screen_row);
+
+    assert!(!panel.auto_scroll());
+    render(&mut panel, VIEW_WIDTH, 10);
+    let scroll_row = seg_start_row(&panel, panel.scroll.seg) + u32::from(panel.scroll.row);
+    assert!(
+        summary_row >= scroll_row && summary_row < scroll_row + 10,
+        "the summary scrolled away"
+    );
+}
+
+#[test]
+fn a_scrolled_up_expansion_keeps_its_position() {
+    let mut panel = compact_panel();
+    for i in 0..8 {
+        panel.push(DisplayMessage::new(
+            DisplayRole::Assistant,
+            format!("filler {i}"),
+        ));
+    }
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    for i in 0..20 {
+        panel.push(DisplayMessage::new(
+            DisplayRole::Assistant,
+            format!("tail {i}"),
+        ));
+    }
+    render(&mut panel, VIEW_WIDTH, 10);
+
+    let summary = summary_seg(&panel, 8);
+    let summary_row = seg_start_row(&panel, summary);
+    panel.scroll_to(ScrollPos {
+        seg: summary,
+        row: 0,
+    });
+    render(&mut panel, VIEW_WIDTH, 10);
+    let before = panel.scroll;
+    let scroll_row = seg_start_row(&panel, before.seg) + u32::from(before.row);
+    let screen_row = u16::try_from(summary_row - scroll_row).expect("summary must be on screen");
+
+    click_row(&mut panel, screen_row);
+
+    assert_eq!(panel.scroll, before);
+    assert!(panel.expanded_folds.contains(&8));
+}
+
+#[test]
+fn expanded_fold_keeps_per_row_toggles() {
+    let mut panel = compact_panel();
+    panel.push(DisplayMessage::new(
+        DisplayRole::Thinking,
+        "thinking line\n".repeat(40),
+    ));
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_done(ToolDoneEvent {
+        output: Arc::new(ToolOutput::Plain(
+            "tool line\n".repeat(40).trim_end().into(),
+        )),
+        ..done("t1")
+    });
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    panel.toggle_fold(0);
+    render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+
+    let thinking = panel
+        .cache
+        .segments()
+        .iter()
+        .position(|seg| seg.msg_index == Some(0))
+        .unwrap();
+    click_segment(&mut panel, thinking);
+    assert!(panel.messages[0].thinking_expanded);
+
+    let tool = panel.cache.find_by_tool_id("t1").unwrap();
+    click_segment(&mut panel, tool);
+    assert!(panel.expanded_tools.get("t1").is_some_and(|exp| exp.output));
+}

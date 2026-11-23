@@ -695,6 +695,7 @@ pub struct UiFileConfig {
     pub thinking_lines: Option<ThinkingLines>,
     pub theme: Option<ThemePair>,
     pub clock_format: Option<ClockFormat>,
+    pub compact_transcript: Option<bool>,
     #[merge(nested_option)]
     pub tool_output_lines: Option<ToolOutputLinesFile>,
     pub max_input_lines: Option<u32>,
@@ -1275,6 +1276,12 @@ pub struct UiConfig {
     #[config(default = ClockFormat::System, ty = "String", default_doc = "system", desc = "Clock format for timestamps: \"12h\", \"24h\", or \"system\" (follow the OS preference, 24h when unknown)")]
     pub clock_format: ClockFormat,
 
+    #[config(
+        default = false,
+        desc = "Compact transcript: fold runs of thinking and tool calls into one activity summary. Off shows every row; click a summary to expand it"
+    )]
+    pub compact_transcript: bool,
+
     #[config(skip, default = "None")]
     pub theme: Option<ThemePair>,
 
@@ -1304,6 +1311,7 @@ impl UiConfig {
                 .thinking_lines
                 .unwrap_or(ThinkingLines::Tail(DEFAULT_THINKING_LINES)),
             clock_format: f.clock_format.unwrap_or_default(),
+            compact_transcript: f.compact_transcript.unwrap_or_default(),
             theme: f.theme,
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
         }
@@ -4046,6 +4054,17 @@ mod tests {
     fn thinking_lines_rejects_below_minus_one() {
         let err = toml::from_str::<RawConfig>("[ui]\nthinking_lines = -2\n").unwrap_err();
         assert!(err.to_string().contains(THINKING_LINES_RANGE), "got: {err}");
+    }
+
+    #[test_case("", false ; "defaults_off")]
+    #[test_case("compact_transcript = true", true ; "parses_true")]
+    #[test_case("compact_transcript = false", false ; "parses_false")]
+    fn compact_transcript(ui: &str, expected: bool) {
+        let raw: RawConfig = toml::from_str(&format!("[ui]\n{ui}\n")).unwrap();
+        assert_eq!(
+            raw.into_config(&[]).unwrap().ui.compact_transcript,
+            expected
+        );
     }
 
     #[test]

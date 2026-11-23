@@ -1457,16 +1457,20 @@ mod tests {
         assert_universal_invariant(pattern);
     }
 
-    /// `link` points four levels deeper, so the `..` that reach the root
-    /// lexically stop inside the tempdir once the symlink is followed. Allowing
-    /// it grants only that subtree, denying it still denies everything.
+    /// The target's padding grows with the link depth, so the `..` that reach
+    /// the root lexically stop inside the tempdir once the symlink is followed,
+    /// however deep the system tempdir sits (macOS nests it five levels down).
+    /// Allowing it grants only that subtree, denying it still denies everything.
     #[test]
     #[cfg(unix)]
     fn lexical_root_through_symlink_is_refused_but_grants_only_its_subtree() {
         let dir = tempfile::tempdir().unwrap();
-        let real = dir.path().join("a/b/c/d");
-        std::fs::create_dir_all(&real).unwrap();
         let link = dir.path().join("link");
+        let real = dir
+            .path()
+            .join("a/b/c/d")
+            .join("pad/".repeat(normal_depth(&link)));
+        std::fs::create_dir_all(&real).unwrap();
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let pattern = format!("{}/**", climb_to_lexical_root(&link));
 

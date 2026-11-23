@@ -83,6 +83,7 @@ All fields are optional. Typos in field names cause an error right away.
 | `max_input_lines` | u32 | `20` | 1 | Maximum visible input lines |
 | `thinking_lines` | integer | `3` | - | Collapse model reasoning to its header and last N lines. Click to toggle. 0 shows only the header, -1 never collapses |
 | `clock_format` | String | `system` | - | Clock format for timestamps: "12h", "24h", or "system" (follow the OS preference, 24h when unknown) |
+| `compact_transcript` | bool | `false` | - | Compact transcript: fold runs of thinking and tool calls into one activity summary. Off shows every row; click a summary to expand it |
 
 ### `ui.theme`
 

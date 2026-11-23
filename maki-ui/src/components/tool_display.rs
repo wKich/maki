@@ -940,6 +940,16 @@ fn header_search_text(tool: &str, header: &str, annotation: Option<&str>) -> Str
     }
 }
 
+/// The first row's text, for a summary standing in for this tool.
+pub fn header_label(msg: &DisplayMessage) -> Option<String> {
+    let tool = msg.role.tool_name()?;
+    let header = msg
+        .text
+        .split_once('\n')
+        .map_or(msg.text.as_str(), |(h, _)| h);
+    Some(format!("{}{header}", header_prefix(tool, header)))
+}
+
 fn push_section(out: &mut String, text: &str) {
     out.push('\n');
     out.push_str(text);

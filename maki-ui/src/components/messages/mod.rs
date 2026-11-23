@@ -1,3 +1,4 @@
+mod fold;
 mod render;
 mod scroll;
 mod segment;
@@ -35,6 +36,7 @@ use ratatui_image::picker::Picker;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -93,6 +95,9 @@ pub struct MessagesPanel {
     viewport_height: u16,
     viewport_width: u16,
     cache: SegmentCache,
+    compact: bool,
+    folds: Vec<fold::Fold>,
+    expanded_folds: HashSet<usize>,
     hl_worker: RenderWorker,
     image_picker: Option<Picker>,
     inline_images: bool,
@@ -158,6 +163,9 @@ impl MessagesPanel {
             viewport_height: 24,
             viewport_width: crossterm::terminal::size().map_or(80, |(w, _)| w.saturating_sub(1)),
             cache: SegmentCache::new(),
+            compact: ui_config.compact_transcript,
+            folds: Vec::new(),
+            expanded_folds: HashSet::new(),
             hl_worker: RenderWorker::new(),
             image_picker: terminal_image::picker(ui_config.inline_images),
             inline_images: ui_config.inline_images,
@@ -235,11 +243,13 @@ impl MessagesPanel {
         };
         *slot = msg;
         self.cache.clear();
+        self.clear_folds();
     }
 
     pub fn load_messages(&mut self, msgs: Vec<DisplayMessage>) {
         self.messages = msgs;
         self.cache.clear();
+        self.clear_folds();
         self.expanded_tools.clear();
         self.lua_clicks.clear();
         self.live_bufs.clear();
@@ -249,8 +259,17 @@ impl MessagesPanel {
         self.live_thinking_expanded = false;
     }
 
+    fn clear_folds(&mut self) {
+        self.folds.clear();
+        self.expanded_folds.clear();
+    }
+
     pub fn thinking_delta(&mut self, text: &str) {
+        let started = self.streaming_thinking.is_empty();
         self.streaming_thinking.push(text);
+        if started && let Some(key) = self.contiguous_fold_key() {
+            self.rebuild_fold_summary(key);
+        }
     }
 
     pub fn text_delta(&mut self, text: &str) {
@@ -317,7 +336,7 @@ impl MessagesPanel {
         msg.text.push('\n');
         msg.text.push_str(&truncated.kept);
         msg.live_output = Some(content.to_owned());
-        self.rebuild_tool_segment(tool_id);
+        self.rebuild_tool_content(tool_id);
     }
 
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
@@ -530,6 +549,10 @@ impl MessagesPanel {
         self.streaming_text.clear();
         self.live_thinking_expanded = false;
         self.cancel_in_progress();
+        if let Some(fold) = self.folds.last() {
+            let key = fold.first_msg;
+            self.rebuild_fold_summary(key);
+        }
     }
 
     pub fn fail_in_progress_with_message(&mut self, message: String) {
@@ -738,6 +761,9 @@ impl MessagesPanel {
     }
 
     pub fn scroll_to_segment(&mut self, segment_index: usize) {
+        if let Some(key) = self.cache.get(segment_index).and_then(|seg| seg.fold) {
+            self.expand_fold(key);
+        }
         self.scroll_to(ScrollPos {
             seg: segment_index,
             row: 0,
@@ -827,6 +853,10 @@ impl MessagesPanel {
         if !seg.images.is_empty() && pos.row >= seg.text_height(width) {
             return false;
         }
+        let fold_key = seg.fold;
+        if let Some(key) = fold_key {
+            return self.toggle_fold(key);
+        }
         let Some(tool_id) = seg.tool_id.as_deref() else {
             return self.try_toggle_cached_thinking(pos.seg, width)
                 || self.try_toggle_cached_notice(pos.seg, width);
@@ -898,6 +928,35 @@ impl MessagesPanel {
         true
     }
 
+    fn toggle_fold(&mut self, key: usize) -> bool {
+        let Some(fold_index) = self.folds.iter().position(|fold| fold.first_msg == key) else {
+            return false;
+        };
+        let expanding = if self.expanded_folds.remove(&key) {
+            false
+        } else {
+            self.expanded_folds.insert(key);
+            true
+        };
+        let was_pinned = self.auto_scroll;
+        self.rebuild_fold_cache(fold_index);
+        if expanding && was_pinned {
+            self.auto_scroll = false;
+        }
+        true
+    }
+
+    fn expand_fold(&mut self, key: usize) {
+        if self.expanded_folds.contains(&key) {
+            return;
+        }
+        let Some(fold_index) = self.folds.iter().position(|fold| fold.first_msg == key) else {
+            return;
+        };
+        self.expanded_folds.insert(key);
+        self.rebuild_fold_cache(fold_index);
+    }
+
     fn rebuild_expanded_tool(&mut self, tool_id: &str) {
         if segment::is_instruction_segment(tool_id) {
             if let Some(parent_id) = segment::instruction_parent(tool_id)
@@ -934,11 +993,14 @@ impl MessagesPanel {
         let smooth = self.streaming_text.is_animating()
             || self.accent.is_animating()
             || (self.streaming_thinking.is_animating()
+                && self.live_thinking_rows_shown()
                 && thinking::reveals_text(self.thinking_lines, self.live_thinking_expanded));
         Cadence::any([
             // A running tool draws a spinner. Its output arriving is data, and
             // `tick` reports that separately.
             Cadence::when(self.in_progress_count() > 0, Cadence::SPINNER),
+            // A live thought draws the fold summary's spinner.
+            Cadence::when(self.live_thought_spins(), Cadence::SPINNER),
             // A moved row's elapsed time only changes once a second, and it
             // may tick for hours.
             self.elapsed_due().map_or(Cadence::IDLE, Cadence::clock),
@@ -1034,11 +1096,13 @@ impl MessagesPanel {
             );
         }
         self.rebuild_line_cache();
-        if self.in_progress_count() > 0 || self.elapsed_due().is_some() {
+        self.rebuild_live_segments(width);
+        // After the live segments, so a summary that `rebuild_live_segments`
+        // just pushed gets the current spinner frame instead of frame zero.
+        if self.in_progress_count() > 0 || self.elapsed_due().is_some() || self.live_thought_spins()
+        {
             self.update_spinners();
         }
-
-        self.rebuild_live_segments(width);
 
         // The reflow window is picked from `scroll` and the bottom pin, and
         // the reflow changes the heights both are derived from: resolve
@@ -1062,7 +1126,7 @@ impl MessagesPanel {
                 break;
             }
             let highlight = self.highlight_segment == Some(i);
-            let style = if seg.tool_id.is_some() {
+            let style = if seg.tool_id.is_some() || seg.summary {
                 Some(theme::current().tool_bg)
             } else if seg.msg_index.is_some_and(|idx| {
                 self.messages
@@ -1124,25 +1188,66 @@ impl MessagesPanel {
     fn rebuild_live_segments(&mut self, width: u16) {
         self.live_start = self.cache.len();
         if !self.streaming_thinking.is_empty() {
-            let collapsed = thinking::collapsed_view(
-                thinking::tail_rows(self.thinking_lines, self.live_thinking_expanded),
-                self.streaming_thinking.line_count(),
-                CLICKABLE,
-                |rows| {
-                    self.streaming_thinking
-                        .render_tail(rows, width)
-                        .map(<[_]>::to_vec)
-                },
-            );
-            let drawn_collapsed = collapsed.is_some();
-            let lines =
-                collapsed.unwrap_or_else(|| self.streaming_thinking.render_lines(width).to_vec());
-            self.push_live_segment(lines, drawn_collapsed);
+            if self.live_thinking_rows_shown() {
+                let collapsed = thinking::collapsed_view(
+                    thinking::tail_rows(self.thinking_lines, self.live_thinking_expanded),
+                    self.streaming_thinking.line_count(),
+                    CLICKABLE,
+                    |rows| {
+                        self.streaming_thinking
+                            .render_tail(rows, width)
+                            .map(<[_]>::to_vec)
+                    },
+                );
+                let drawn_collapsed = collapsed.is_some();
+                let lines = collapsed
+                    .unwrap_or_else(|| self.streaming_thinking.render_lines(width).to_vec());
+                self.push_live_segment(lines, drawn_collapsed);
+            } else if self.contiguous_fold_key().is_none() {
+                self.push_live_thought_summary(width);
+            }
         }
         if !self.streaming_text.is_empty() {
             let lines = self.streaming_text.render_lines(width).to_vec();
             self.push_live_segment(lines, false);
         }
+    }
+
+    /// Raw reasoning rows are only drawn where the reader asked for detail:
+    /// full mode, or an expanded run.
+    fn live_thinking_rows_shown(&self) -> bool {
+        !self.compact
+            || self
+                .contiguous_fold_key()
+                .is_some_and(|key| self.expanded_folds.contains(&key))
+    }
+
+    /// The fold the streaming thought would join once it flushes into a
+    /// message, which is the last run only while it still reaches the end.
+    fn contiguous_fold_key(&self) -> Option<usize> {
+        self.folds
+            .last()
+            .filter(|fold| fold.end_msg == self.messages.len())
+            .map(|fold| fold.first_msg)
+    }
+
+    fn live_thought_spins(&self) -> bool {
+        !self.streaming_thinking.is_empty() && !self.live_thinking_rows_shown()
+    }
+
+    /// A thought that starts a run shows as the summary row its fold takes
+    /// over when the thought flushes, so reasoning never gets a row of its own.
+    fn push_live_thought_summary(&mut self, width: u16) {
+        let summary = fold::FoldSummary {
+            thoughts: 1,
+            finished: 1,
+            live_thought: true,
+            ..fold::FoldSummary::default()
+        };
+        let (lines, gutter, spins) = fold::summary_line(&summary, &[], false, body_width(width));
+        self.cache.push_spacer_if_needed();
+        self.cache
+            .push(Segment::summary(None, lines, gutter, spins));
     }
 
     fn push_live_segment(&mut self, lines: Vec<Line<'static>>, collapsed: bool) {
@@ -1225,6 +1330,13 @@ impl MessagesPanel {
             .segments()
             .iter()
             .map(|seg| {
+                if let Some(key) = seg.fold {
+                    return if self.expanded_folds.contains(&key) {
+                        String::new()
+                    } else {
+                        self.fold_search_text(key)
+                    };
+                }
                 match seg.tool_id.as_deref() {
                     Some(id) => tool_text(id),
                     None => seg
@@ -1235,6 +1347,33 @@ impl MessagesPanel {
                 .unwrap_or_default()
             })
             .collect()
+    }
+
+    /// A collapsed summary's rows have no segments, so their text rides along
+    /// on the summary instead.
+    fn fold_search_text(&self, key: usize) -> String {
+        let Some(fold) = self.folds.iter().find(|fold| fold.first_msg == key) else {
+            return String::new();
+        };
+        let end = fold.end_msg.min(self.messages.len());
+        let mut out = String::new();
+        for msg in &self.messages[fold.first_msg..end] {
+            let mut text = match &msg.role {
+                DisplayRole::Tool(_) => search_text_for(msg),
+                _ => message_search_text(msg),
+            };
+            if let Some(blocks) = msg
+                .tool_output
+                .as_deref()
+                .and_then(ToolOutput::instructions)
+            {
+                text.push('\n');
+                text.push_str(&instructions_search_text(blocks));
+            }
+            out.push_str(&text);
+            out.push('\n');
+        }
+        out
     }
 
     pub fn extract_selection_text(&self, sel: &Selection, msg_area: Rect) -> String {
@@ -1398,7 +1537,11 @@ impl MessagesPanel {
                 msg.render_snapshot = Some(snapshot);
             }
             msg.snapshot_theme_gen = applied_gen;
-            self.rebuild_tool_segment(tool_id);
+            if is_header {
+                self.rebuild_tool_segment(tool_id);
+            } else {
+                self.rebuild_tool_content(tool_id);
+            }
         } else {
             warn!(
                 tool_id,
@@ -1571,81 +1714,235 @@ impl MessagesPanel {
         dirty
     }
 
+    /// Patches the row and the fold summary that stands in for it, if any.
     fn rebuild_tool_segment(&mut self, tool_id: &str) {
-        let Some(msg) = self
+        self.rebuild_tool_segment_inner(tool_id, true);
+    }
+
+    /// Content-only updates (output, body snapshots) leave a collapsed
+    /// summary's counts and busy header alone.
+    fn rebuild_tool_content(&mut self, tool_id: &str) {
+        self.rebuild_tool_segment_inner(tool_id, false);
+    }
+
+    fn rebuild_tool_segment_inner(&mut self, tool_id: &str, summary: bool) {
+        let Some(msg_index) = self
             .messages
             .iter()
-            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
+            .rposition(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
         else {
             return;
         };
+        if self.compact
+            && let Some(fold_index) = self.fold_index_of(msg_index)
+        {
+            if !fold::is_foldable(&self.messages[msg_index]) {
+                self.invalidate_fold(fold_index, msg_index);
+                return;
+            }
+            let key = self.folds[fold_index].first_msg;
+            if !self.expanded_folds.contains(&key) {
+                if summary {
+                    self.rebuild_fold_summary(key);
+                }
+                return;
+            }
+            self.rebuild_tool_row(msg_index);
+            if summary {
+                self.rebuild_fold_summary(key);
+            }
+            return;
+        }
+        self.rebuild_tool_row(msg_index);
+    }
+
+    fn rebuild_tool_row(&mut self, msg_index: usize) {
+        let msg = &self.messages[msg_index];
         let DisplayRole::Tool(t) = &msg.role else {
-            unreachable!()
-        };
-        let status = t.status;
-        let Some(seg_idx) = self.cache.find_by_tool_id(tool_id) else {
             return;
         };
-
+        let status = t.status;
+        let Some(seg_idx) = self.cache.find_by_tool_id(&t.id) else {
+            return;
+        };
+        let tool_id = t.id.clone();
         let exp = self
             .expanded_tools
-            .get(tool_id)
+            .get(&tool_id)
             .copied()
             .unwrap_or_default();
         let rctx = self.rctx();
         let tl = Self::build_tool_segment_lines(msg, status, &rctx, exp);
-
         let instructions = msg
             .tool_output
             .as_deref()
             .and_then(|o| o.owned_instructions());
-
         let seg = self.cache.get_mut(seg_idx).unwrap();
         seg.update_with_reuse(tl, &self.hl_worker);
         seg.set_images(message_images(msg));
-
         if let Some(blocks) = instructions {
-            self.upsert_instruction_segment(tool_id, &blocks);
+            self.upsert_instruction_segment(&tool_id, &blocks);
+        }
+    }
+
+    fn fold_index_of(&self, msg_index: usize) -> Option<usize> {
+        let index = self
+            .folds
+            .partition_point(|fold| fold.first_msg <= msg_index)
+            .checked_sub(1)?;
+        (msg_index < self.folds[index].end_msg).then_some(index)
+    }
+
+    fn invalidate_fold(&mut self, fold_index: usize, msg_index: usize) {
+        if self.folds[fold_index].first_msg == msg_index {
+            self.expanded_folds.remove(&msg_index);
+        }
+        self.rebuild_fold_cache(fold_index);
+    }
+
+    fn rebuild_fold_cache(&mut self, fold_index: usize) {
+        let (spacer_seg, first_msg) = {
+            let fold = &self.folds[fold_index];
+            (fold.spacer_seg, fold.first_msg)
+        };
+        self.cache.truncate_for_rebuild(spacer_seg, first_msg);
+        self.folds.truncate(fold_index);
+        self.rebuild_line_cache();
+        self.live_start = self.cache.len();
+    }
+
+    fn rebuild_fold_summary(&mut self, key: usize) {
+        let Some(fold_index) = self.folds.iter().position(|fold| fold.first_msg == key) else {
+            return;
+        };
+        let (lines, gutter, spins, summary_seg) = {
+            let fold = &self.folds[fold_index];
+            let end = fold.end_msg.min(self.messages.len());
+            let messages = &self.messages[fold.first_msg..end];
+            let mut summary = fold::summarize_fold(messages);
+            if fold_index + 1 == self.folds.len()
+                && fold.end_msg == self.messages.len()
+                && !self.streaming_thinking.is_empty()
+            {
+                summary.thoughts += 1;
+                summary.finished += 1;
+                summary.live_thought = true;
+            }
+            let (lines, gutter, spins) = fold::summary_line(
+                &summary,
+                messages,
+                self.expanded_folds.contains(&key),
+                body_width(self.viewport_width),
+            );
+            (lines, gutter, spins, fold.summary_seg)
+        };
+        if let Some(seg) = self.cache.get_mut(summary_seg) {
+            *seg = Segment::summary(Some(key), lines, gutter, spins);
         }
     }
 
     fn rebuild_line_cache(&mut self) {
+        let start = self.cache.msg_count();
         if !self.cache.needs_rebuild(self.messages.len()) {
             return;
         }
-        for i in self.cache.msg_count()..self.messages.len() {
-            let msg = &self.messages[i];
-
-            if let DisplayRole::Tool(t) = &msg.role {
-                let exp = self.expanded_tools.get(&t.id).copied().unwrap_or_default();
-                let status = t.status;
-                let tl = Self::build_tool_segment_lines(msg, status, &self.rctx(), exp);
-                let id = t.id.clone();
-                self.cache.push_spacer_if_needed();
-                let mut seg = Segment::with_tool(id.clone());
-                seg.apply_highlight(tl, &self.hl_worker);
-                seg.set_images(message_images(msg));
-                self.cache.push(seg);
-                self.cache.reserve_instructions(&id);
-
-                let blocks = msg
-                    .tool_output
-                    .as_deref()
-                    .and_then(|o| o.owned_instructions());
-                if let Some(blocks) = blocks {
-                    self.upsert_instruction_segment(&id, &blocks);
-                }
-            } else {
-                let view = message_view(msg, self.thinking_lines, self.viewport_width);
-                self.cache.push_spacer_if_needed();
-                let mut seg = Segment::with_lines(view.lines, Some(i));
-                seg.gutter = view.gutter;
-                seg.truncation.output = view.collapsed;
-                seg.set_images(message_images(msg));
-                self.cache.push(seg);
+        if self.compact {
+            self.rebuild_compact(start);
+        } else {
+            for i in start..self.messages.len() {
+                self.push_message_segment(i);
             }
         }
         self.cache.mark_built(self.messages.len());
+    }
+
+    fn rebuild_compact(&mut self, start: usize) {
+        let mut plans = fold::fold_plan(&self.messages[start..], self.compact);
+        for plan in &mut plans {
+            plan.start += start;
+            plan.end += start;
+        }
+        let mut next_plan = 0;
+        let mut i = start;
+        if let Some(first) = plans.first()
+            && first.start == start
+            && self.folds.last().is_some_and(|fold| fold.end_msg == start)
+        {
+            let end = first.end;
+            let key = self.folds.last().unwrap().first_msg;
+            self.folds.last_mut().unwrap().end_msg = end;
+            if self.expanded_folds.contains(&key) {
+                for i in first.clone() {
+                    self.push_message_segment(i);
+                }
+            }
+            self.rebuild_fold_summary(key);
+            next_plan = 1;
+            i = end;
+        }
+        while i < self.messages.len() {
+            if let Some(plan) = plans.get(next_plan).filter(|plan| plan.start == i) {
+                self.open_fold(plan.clone());
+                i = plan.end;
+                next_plan += 1;
+            } else {
+                self.push_message_segment(i);
+                i += 1;
+            }
+        }
+    }
+
+    fn open_fold(&mut self, plan: Range<usize>) {
+        let spacer_seg = self.cache.len();
+        self.cache.push_spacer_if_needed();
+        let summary_seg = self.cache.len();
+        self.cache.push(Segment::default());
+        let key = plan.start;
+        let expanded = self.expanded_folds.contains(&key);
+        self.folds.push(fold::Fold {
+            first_msg: key,
+            end_msg: plan.end,
+            summary_seg,
+            spacer_seg,
+        });
+        if expanded {
+            for i in plan {
+                self.push_message_segment(i);
+            }
+        }
+        self.rebuild_fold_summary(key);
+    }
+
+    fn push_message_segment(&mut self, i: usize) {
+        let msg = &self.messages[i];
+        if let DisplayRole::Tool(t) = &msg.role {
+            let exp = self.expanded_tools.get(&t.id).copied().unwrap_or_default();
+            let status = t.status;
+            let tl = Self::build_tool_segment_lines(msg, status, &self.rctx(), exp);
+            let id = t.id.clone();
+            self.cache.push_spacer_if_needed();
+            let mut seg = Segment::with_tool(id.clone());
+            seg.apply_highlight(tl, &self.hl_worker);
+            seg.set_images(message_images(msg));
+            self.cache.push(seg);
+            self.cache.reserve_instructions(&id);
+
+            let blocks = msg
+                .tool_output
+                .as_deref()
+                .and_then(|o| o.owned_instructions());
+            if let Some(blocks) = blocks {
+                self.upsert_instruction_segment(&id, &blocks);
+            }
+        } else {
+            let view = message_view(msg, self.thinking_lines, self.viewport_width);
+            self.cache.push_spacer_if_needed();
+            let mut seg = Segment::with_lines(view.lines, Some(i));
+            seg.gutter = view.gutter;
+            seg.truncation.output = view.collapsed;
+            seg.set_images(message_images(msg));
+            self.cache.push(seg);
+        }
     }
 
     /// Clamps the scroll position against the document end and applies the
@@ -1717,6 +2014,10 @@ impl MessagesPanel {
             return;
         };
         seg.stale = false;
+        if let Some(key) = seg.fold {
+            self.rebuild_fold_summary(key);
+            return;
+        }
         let Some(tid) = seg.tool_id.clone() else {
             self.reflow_text_segment(seg_idx, width);
             return;

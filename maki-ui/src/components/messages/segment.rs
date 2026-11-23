@@ -79,6 +79,12 @@ pub(super) struct Segment {
     /// the click finds its message. Rendering also reads it to give user
     /// messages the `user_bg` base style.
     pub msg_index: Option<usize>,
+    /// Set on a compact-mode summary: the key of the fold this row stands in
+    /// for, which is its first message index.
+    pub fold: Option<usize>,
+    /// A compact-mode summary, folded or still live. It takes the tool row
+    /// background even before it has a fold key.
+    pub summary: bool,
     /// What a click can expand. On thinking, `output` means it is drawn
     /// collapsed: the click answers what the reader sees, not the config.
     pub truncation: SectionFlags,
@@ -120,6 +126,22 @@ impl Segment {
         Self {
             lines,
             msg_index,
+            ..Self::default()
+        }
+    }
+
+    pub fn summary(
+        fold: Option<usize>,
+        lines: Vec<Line<'static>>,
+        gutter: Span<'static>,
+        gutter_spins: bool,
+    ) -> Self {
+        Self {
+            lines,
+            fold,
+            summary: true,
+            gutter: Some(gutter),
+            gutter_spins,
             ..Self::default()
         }
     }
@@ -433,6 +455,13 @@ impl SegmentCache {
         self.segments.truncate(len);
     }
 
+    /// Drops the cache back to the start of a fold so the next build re-derives
+    /// its segments from `msg_count`.
+    pub fn truncate_for_rebuild(&mut self, len: usize, msg_count: usize) {
+        self.segments.truncate(len);
+        self.msg_count = msg_count;
+    }
+
     /// Books the spacer and instruction slots a tool fills in later, when its
     /// output finally arrives. Splicing them in at that point would shift
     /// every segment after them, and plenty of things hold a segment index by
@@ -712,6 +741,19 @@ mod tests {
             gutter: Some(Span::raw("● ")),
             ..Segment::with_lines(lines, None)
         }
+    }
+
+    #[test]
+    fn truncate_for_rebuild_resets_segments_and_message_count() {
+        let mut cache = SegmentCache::new();
+        cache.push(Segment::with_lines(vec![Line::raw("a")], None));
+        cache.push(Segment::with_lines(vec![Line::raw("b")], None));
+        cache.mark_built(2);
+
+        cache.truncate_for_rebuild(1, 1);
+
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.msg_count(), 1);
     }
 
     #[test]

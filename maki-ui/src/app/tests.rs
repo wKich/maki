@@ -32,7 +32,7 @@ use maki_agent::agent::TranscriptError;
 use maki_agent::command::{CommandScope, CustomCommand};
 use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PermissionAnswer, PermissionManager};
 use maki_agent::session::NOTHING_TO_STORE;
-use maki_agent::tools::ToolRegistry;
+use maki_agent::tools::{BASH_TOOL_NAME, ToolRegistry};
 use maki_agent::{
     AgentMode, BackgroundNotice, BufferSnapshot, CallRecord, Cutter, DoneReason, EndReason,
     HistorySnapshot, ImageMediaType, ImageSource, McpConfigErrors, McpPromptArg, McpPromptInfo,
@@ -182,7 +182,19 @@ fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
 }
 
 fn build_app(dir: StateDir, writer: Arc<StorageWriter>) -> App {
-    build_app_with_lua(dir, writer, LuaCommandReader::empty())
+    build_app_with_ui_config(dir, writer, UiConfig::default())
+}
+
+fn build_app_with_ui_config(dir: StateDir, writer: Arc<StorageWriter>, ui_config: UiConfig) -> App {
+    let tab = OpenSession::fresh(TEST_MODEL_SPEC, TEST_CWD, &dir);
+    build_app_with_session(
+        dir,
+        writer,
+        LuaCommandReader::empty(),
+        tab,
+        test_permissions(false),
+        ui_config,
+    )
 }
 
 fn build_app_with_lua(
@@ -191,7 +203,14 @@ fn build_app_with_lua(
     lua_commands: LuaCommandReader,
 ) -> App {
     let tab = OpenSession::fresh(TEST_MODEL_SPEC, TEST_CWD, &dir);
-    build_app_with_session(dir, writer, lua_commands, tab, test_permissions(false))
+    build_app_with_session(
+        dir,
+        writer,
+        lua_commands,
+        tab,
+        test_permissions(false),
+        UiConfig::default(),
+    )
 }
 
 fn test_permissions(yolo: bool) -> Arc<PermissionManager> {
@@ -213,6 +232,7 @@ fn build_app_with_session(
     lua_commands: LuaCommandReader,
     tab: OpenSession,
     permissions: Arc<PermissionManager>,
+    ui_config: UiConfig,
 ) -> App {
     // Mirrors the event loop, where the session's own spec decides and the
     // startup model catches one that will not resolve.
@@ -230,7 +250,7 @@ fn build_app_with_session(
         HintReader::empty(),
         InputRulesReader::empty(),
         writer,
-        UiConfig::default(),
+        ui_config,
         100,
         permissions,
         Arc::from([]),
@@ -262,7 +282,14 @@ pub(crate) fn test_app() -> App {
 fn spawned_app(tab: OpenSession, permissions: Arc<PermissionManager>) -> App {
     let dir = tmp_state();
     let writer = Arc::new(test_writer(dir.clone()));
-    let mut app = build_app_with_session(dir, writer, LuaCommandReader::empty(), tab, permissions);
+    let mut app = build_app_with_session(
+        dir,
+        writer,
+        LuaCommandReader::empty(),
+        tab,
+        permissions,
+        UiConfig::default(),
+    );
     let (shared_queue, _rx, _notify_rx) = shared_queue::queue();
     app.queue.set_shared(shared_queue);
     app
@@ -310,10 +337,14 @@ fn app_with_hints() -> (App, HintWriterHandle) {
 }
 
 fn tempdir_app() -> (TempDir, StateDir, Arc<StorageWriter>, App) {
+    tempdir_app_with_ui_config(UiConfig::default())
+}
+
+fn tempdir_app_with_ui_config(ui_config: UiConfig) -> (TempDir, StateDir, Arc<StorageWriter>, App) {
     let tmp = TempDir::new().unwrap();
     let dir = StateDir::from_path(tmp.path().to_path_buf());
     let writer = Arc::new(test_writer(dir.clone()));
-    let app = build_app(dir.clone(), Arc::clone(&writer));
+    let app = build_app_with_ui_config(dir.clone(), Arc::clone(&writer), ui_config);
     (tmp, dir, writer, app)
 }
 
@@ -13535,4 +13566,49 @@ fn a_requested_compaction_wins_its_single_taker(status: Status, claimed: bool) {
             Some(COMPACT_INSTRUCTIONS)
         );
     }
+}
+
+#[test]
+fn compact_transcript_leaves_the_session_payload_unchanged() {
+    let (_full_tmp, _full_dir, _full_writer, mut full) = tempdir_app();
+    let (_compact_tmp, _compact_dir, _compact_writer, mut compact) =
+        tempdir_app_with_ui_config(UiConfig {
+            compact_transcript: true,
+            ..UiConfig::default()
+        });
+
+    for app in [&mut full, &mut compact] {
+        app.status = Status::Streaming;
+        app.run_id = 1;
+        app.update(agent_msg(tool_start("t1", BASH_TOOL_NAME)));
+        app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
+            call: None,
+            id: "t1".into(),
+            tool: BASH_TOOL_NAME.into(),
+            output: Arc::new(ToolOutput::Plain("output".into())),
+            is_error: false,
+            annotation: None,
+            written_path: None,
+            backgrounded: false,
+        }))));
+    }
+
+    assert!(compact.ui_config.compact_transcript);
+    assert_eq!(
+        serde_json::to_value(full.export().messages.as_ref()).unwrap(),
+        serde_json::to_value(compact.export().messages.as_ref()).unwrap()
+    );
+
+    let prompt = QueuedMessage {
+        text: "hi".into(),
+        images: Vec::new(),
+    };
+    let full_input = full.build_agent_input(&prompt);
+    let compact_input = compact.build_agent_input(&prompt);
+    assert_eq!(compact_input.message, full_input.message);
+    assert_eq!(compact_input.mode, full_input.mode);
+    assert_eq!(compact_input.preamble, full_input.preamble);
+    assert_eq!(compact_input.workflow, full_input.workflow);
+    assert_eq!(compact_input.thinking, full_input.thinking);
+    assert_eq!(compact_input.fast, full_input.fast);
 }
